@@ -27,6 +27,8 @@ from utils.db.connection_pool import db_pool
 
 logger = logging.getLogger(__name__)
 
+_UNKNOWN_ACTION = "Unknown Action"
+
 
 def _get_org_email_recipients(org_id: str, user_id: str) -> list:
     """Fetch verified and enabled email recipients for an org."""
@@ -139,37 +141,74 @@ def _enrich_incident_summary(incident_data: Dict[str, Any], session_id: str, use
         logger.warning(f"[Dispatcher] Failed to enrich summary: {e}")
 
 
+def _fetch_action_run_details(run_id: str, user_id: str) -> tuple:
+    """Fetch action name and started_at from action_runs. Returns (name, started_at)."""
+    try:
+        with db_pool.get_admin_connection() as conn:
+            with conn.cursor() as cur:
+                set_rls_context(cur, conn, user_id, log_prefix="[Dispatcher:ActionData]")
+                cur.execute(
+                    """SELECT a.name, ar.started_at
+                       FROM action_runs ar
+                       JOIN actions a ON a.id = ar.action_id
+                       WHERE ar.id = %s""",
+                    (run_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return _UNKNOWN_ACTION, None
+                started = row[1]
+                if started and not started.tzinfo:
+                    started = started.replace(tzinfo=timezone.utc)
+                elif started:
+                    started = started.astimezone(timezone.utc)
+                return row[0], started
+    except Exception as e:
+        logger.warning("[Dispatcher] Failed to fetch action run details: %s", e)
+    return _UNKNOWN_ACTION, None
+
+
+def _fetch_last_bot_message(session_id: str, user_id: str) -> Optional[str]:
+    """Fetch the last bot message text from a chat session."""
+    try:
+        with db_pool.get_admin_connection() as conn:
+            with conn.cursor() as cur:
+                set_rls_context(cur, conn, user_id, log_prefix="[Dispatcher:ActionResult]")
+                cur.execute(
+                    "SELECT messages FROM chat_sessions WHERE id = %s",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    return None
+                messages = row[0] if isinstance(row[0], list) else json.loads(row[0])
+                for msg in reversed(messages):
+                    if msg.get('sender') == 'bot' and msg.get('text'):
+                        return msg['text']
+    except Exception as e:
+        logger.warning("[Dispatcher] Failed to fetch action result summary: %s", e)
+    return None
+
+
 def _get_action_data(user_id: str, trigger_metadata: Dict[str, Any], session_id: str,
                      status: str = 'running', error_message: Optional[str] = None) -> Dict[str, Any]:
     """Build action data dict from trigger metadata and optional DB lookup."""
     run_id = trigger_metadata.get('run_id')
-    action_name = "Unknown Action"
+    action_name = _UNKNOWN_ACTION
+    result_summary = None
     started_at = None
 
     if run_id:
-        try:
-            with db_pool.get_admin_connection() as conn:
-                with conn.cursor() as cur:
-                    set_rls_context(cur, conn, user_id, log_prefix="[Dispatcher:ActionData]")
-                    cur.execute(
-                        """SELECT a.name, ar.started_at
-                           FROM action_runs ar
-                           JOIN actions a ON a.id = ar.action_id
-                           WHERE ar.id = %s""",
-                        (run_id,),
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        action_name = row[0]
-                        if row[1]:
-                            started_at = row[1].astimezone(timezone.utc) if row[1].tzinfo else row[1].replace(tzinfo=timezone.utc)
-                        else:
-                            started_at = None
-        except Exception as e:
-            logger.warning("[Dispatcher] Failed to fetch action run details: %s", e)
+        action_name, started_at = _fetch_action_run_details(run_id, user_id)
+
+    if session_id and status == 'success' and not error_message:
+        last_bot_text = _fetch_last_bot_message(session_id, user_id)
+        if last_bot_text:
+            result_summary = _summarize_action_result(action_name, last_bot_text, user_id)
 
     return {
         'action_name': action_name,
+        'result_summary': result_summary,
         'run_id': run_id,
         'status': status,
         'error': error_message,
@@ -177,6 +216,103 @@ def _get_action_data(user_id: str, trigger_metadata: Dict[str, Any], session_id:
         'completed_at': datetime.now(timezone.utc) if status != 'running' else None,
         'session_id': session_id,
     }
+
+
+def _summarize_action_result(action_name: str, bot_response: str, user_id: str) -> Optional[str]:
+    """Summarize an action's output into key results using a lightweight LLM call."""
+    try:
+        from langchain_core.messages import HumanMessage
+        from chat.backend.agent.providers import create_chat_model
+        from chat.backend.agent.llm import ModelConfig
+        from chat.backend.agent.utils.llm_usage_tracker import tracked_invoke
+
+        truncated_response = bot_response[:4000]
+
+        prompt = f"""Summarize the outcome of action "{action_name}" in ONE short sentence. State counts and status, not specifics.
+
+Example: "Found 5 critical vulnerabilities across 3 services" or "2 active EC2 instances in us-east-1, both healthy"
+
+Response:
+{truncated_response}
+
+One-line summary:"""
+
+        llm = create_chat_model(
+            ModelConfig.INCIDENT_REPORT_SUMMARIZATION_MODEL,
+            temperature=0.1,
+            streaming=False,
+            request_timeout=25,
+        )
+
+        response = tracked_invoke(
+            llm,
+            [HumanMessage(content=prompt)],
+            user_id=user_id,
+            session_id=None,
+            model_name=ModelConfig.INCIDENT_REPORT_SUMMARIZATION_MODEL,
+            request_type="action_result_summary",
+        )
+
+        if response and response.content:
+            content = response.content
+            if isinstance(content, list):
+                content = " ".join(
+                    str(p.get("text") or "") if isinstance(p, dict) else str(p)
+                    for p in content
+                    if not (isinstance(p, dict) and p.get("type") in ("thinking", "reasoning"))
+                )
+            summary = " ".join(str(content).split())
+            if summary:
+                return summary[:300]
+        return None
+
+    except Exception as e:
+        logger.warning("[Dispatcher] Failed to summarize action result: %s", e)
+        return None
+
+
+def _store_start_message_info(run_id: str, msg_info: Dict[str, str], user_id: str) -> None:
+    """Store the Slack started message ts/channel in action_runs.trigger_context."""
+    try:
+        with db_pool.get_admin_connection() as conn:
+            with conn.cursor() as cur:
+                set_rls_context(cur, conn, user_id, log_prefix="[Dispatcher:StoreStartMsg]")
+                cur.execute(
+                    """UPDATE action_runs
+                       SET trigger_context = COALESCE(trigger_context, '{}'::jsonb)
+                           || %s::jsonb
+                       WHERE id = %s""",
+                    (json.dumps({
+                        'slack_start_message_ts': msg_info['ts'],
+                        'slack_start_message_channel': msg_info['channel_id'],
+                    }), run_id),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning("[Dispatcher] Failed to store start message info: %s", e)
+
+
+def _get_start_message_info(run_id: str, user_id: str) -> Optional[Dict[str, str]]:
+    """Retrieve the stored Slack started message ts/channel from action_runs."""
+    try:
+        with db_pool.get_admin_connection() as conn:
+            with conn.cursor() as cur:
+                set_rls_context(cur, conn, user_id, log_prefix="[Dispatcher:GetStartMsg]")
+                cur.execute(
+                    "SELECT trigger_context FROM action_runs WHERE id = %s",
+                    (run_id,),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    ctx = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                    ts = ctx.get('slack_start_message_ts')
+                    channel = ctx.get('slack_start_message_channel')
+                    if ts:
+                        return {'ts': ts, 'channel_id': channel}
+        return None
+    except Exception as e:
+        logger.warning("[Dispatcher] Failed to get start message info: %s", e)
+        return None
 
 
 def _send_emails(org_id: str, user_id: str, send_fn_name: str, payload: Any) -> None:
@@ -337,7 +473,10 @@ def notify_action_started(user_id: str, trigger_metadata: Dict[str, Any], sessio
                 from utils.notifications.slack_notification_service import (
                     send_slack_action_started_notification,
                 )
-                send_slack_action_started_notification(user_id, action_data)
+                msg_info = send_slack_action_started_notification(user_id, action_data)
+                # Store the message ts so we can delete it when the action completes
+                if msg_info and trigger_metadata.get('run_id'):
+                    _store_start_message_info(trigger_metadata['run_id'], msg_info, user_id)
             except Exception:
                 logger.exception("[Dispatcher] Slack action started notification failed")
 
@@ -354,6 +493,14 @@ def notify_action_completed(user_id: str, trigger_metadata: Dict[str, Any], sess
             return
 
         action_data = _get_action_data(user_id, trigger_metadata, session_id, status=status, error_message=error_message)
+
+        # Retrieve the stored start message info for deletion
+        run_id = trigger_metadata.get('run_id')
+        if run_id:
+            start_msg_info = _get_start_message_info(run_id, user_id)
+            if start_msg_info:
+                action_data['start_message_ts'] = start_msg_info['ts']
+                action_data['start_message_channel'] = start_msg_info.get('channel_id')
 
         # --- Email ---
         email_enabled = bool(get_org_preference(org_id, 'action_email_notifications', default=False))

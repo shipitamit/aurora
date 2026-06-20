@@ -471,7 +471,7 @@ def send_slack_investigation_failed_notification(
         return False
 
 
-def send_slack_action_started_notification(user_id: str, action_data: Dict[str, Any]) -> bool:
+def send_slack_action_started_notification(user_id: str, action_data: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """
     Send Slack notification when an action starts running.
 
@@ -480,20 +480,20 @@ def send_slack_action_started_notification(user_id: str, action_data: Dict[str, 
         action_data: Dictionary with action_name, run_id, session_id, started_at
 
     Returns:
-        True if message sent successfully, False otherwise
+        Dict with 'ts' and 'channel_id' if sent successfully, None otherwise
     """
     try:
         client = get_slack_client_for_user(user_id)
         if not client:
-            return False
+            return None
 
         channel_id = _get_incidents_channel_id(user_id, client)
         if not channel_id:
-            return False
+            return None
 
         action_name = action_data.get('action_name', 'Unknown Action')
-        session_id = action_data.get('session_id', '')
-        session_url = f"{FRONTEND_URL}/chat?sessionId={session_id}" if session_id else None
+
+        detail_text = f"*Action:* {action_name}\n*Status:* Running"
 
         blocks = [
             {
@@ -507,26 +507,18 @@ def send_slack_action_started_notification(user_id: str, action_data: Dict[str, 
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*Action:* {action_name}\n*Status:* Running"
+                    "text": detail_text
                 }
             }
         ]
-
-        if session_url:
-            blocks[1]["accessory"] = {
-                "type": "button",
-                "text": {
-                    "type": "plain_text",
-                    "text": "View Session"
-                },
-                "url": session_url,
-            }
 
         from routes.slack.slack_events_helpers import validate_slack_blocks
         if not validate_slack_blocks(blocks):
             simple_text = f"*Action Started:* {action_name}"
             result = client.send_message(channel=channel_id, text=simple_text)
-            return result is not None
+            if result and result.get('ts'):
+                return {'ts': result['ts'], 'channel_id': channel_id}
+            return None
 
         result = client.send_message(
             channel=channel_id,
@@ -534,19 +526,33 @@ def send_slack_action_started_notification(user_id: str, action_data: Dict[str, 
             blocks=blocks
         )
 
-        if result:
+        if result and result.get('ts'):
             logger.info(f"[SlackNotification] Sent action started notification for '{action_name}'")
-            return True
-        return False
+            return {'ts': result['ts'], 'channel_id': channel_id}
+        return None
 
     except Exception:
         logger.exception("[SlackNotification] Error sending action started notification")
-        return False
+        return None
+
+
+def _delete_start_message(client: SlackClient, action_data: Dict[str, Any], fallback_channel: str) -> None:
+    """Delete the 'Action Started' message if its ts was stored."""
+    start_msg_ts = action_data.get('start_message_ts')
+    if not start_msg_ts:
+        return
+    channel = action_data.get('start_message_channel') or fallback_channel
+    try:
+        client.delete_message(channel=channel, ts=start_msg_ts)
+        logger.info(f"[SlackNotification] Deleted action started message {start_msg_ts}")
+    except Exception as e:
+        logger.warning(f"[SlackNotification] Failed to delete started message: {e}")
 
 
 def send_slack_action_completed_notification(user_id: str, action_data: Dict[str, Any]) -> bool:
     """
     Send Slack notification when an action completes (success or error).
+    Deletes the "Action Started" message if one was stored.
 
     Args:
         user_id: User ID
@@ -567,6 +573,7 @@ def send_slack_action_completed_notification(user_id: str, action_data: Dict[str
         action_name = action_data.get('action_name', 'Unknown Action')
         status = action_data.get('status', 'unknown')
         error_message = action_data.get('error')
+        result_summary = action_data.get('result_summary')
         session_id = action_data.get('session_id', '')
         session_url = f"{FRONTEND_URL}/chat?sessionId={session_id}" if session_id else None
 
@@ -574,6 +581,8 @@ def send_slack_action_completed_notification(user_id: str, action_data: Dict[str
         status_text = "Completed Successfully" if status == 'success' else "Failed"
 
         detail_text = f"*Action:* {action_name}\n*Status:* {status_emoji} {status_text}"
+        if result_summary:
+            detail_text += f"\n*Result:* {result_summary}"
         if error_message:
             truncated_error = error_message[:200] + "..." if len(error_message) > 200 else error_message
             detail_text += f"\n*Error:* {truncated_error}"
@@ -609,7 +618,10 @@ def send_slack_action_completed_notification(user_id: str, action_data: Dict[str
         if not validate_slack_blocks(blocks):
             simple_text = f"*Action Complete:* {action_name} — {status_text}"
             result = client.send_message(channel=channel_id, text=simple_text)
-            return result is not None
+            if result is not None:
+                _delete_start_message(client, action_data, channel_id)
+                return True
+            return False
 
         result = client.send_message(
             channel=channel_id,
@@ -618,6 +630,7 @@ def send_slack_action_completed_notification(user_id: str, action_data: Dict[str
         )
 
         if result:
+            _delete_start_message(client, action_data, channel_id)
             logger.info(f"[SlackNotification] Sent action completed notification for '{action_name}' ({status})")
             return True
         return False
