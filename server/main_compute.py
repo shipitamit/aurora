@@ -226,6 +226,7 @@ _OPEN_PREFIXES = (
     "/jenkins/webhook/",
     "/cloudbees/webhook/",
     "/spinnaker/webhook/",
+    "/jira/webhook/",
     "/incidentio/alerts/webhook/",
     "/ovh_api/ovh/oauth2/callback",
     "/azure/callback",
